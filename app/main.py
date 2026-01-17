@@ -191,6 +191,56 @@ VALID_RULE_TYPES = {'gpa', 'degree', 'nationality', 'age', 'work_experience', 'l
 VALID_REQ_TYPES = {'transcript', 'cv', 'essay', 'references', 'proposal', 'test', 'interview', 'other'}
 VALID_STAGES = {'application', 'interview', 'nomination', 'result'}
 VALID_CONFIDENCE = {'high', 'medium', 'inferred'}
+VALID_LEVELS = {'bachelor', 'masters', 'phd', 'postdoc'}
+VALID_FUNDING_TYPES = {'full', 'partial', 'tuition_only', 'stipend_only'}
+
+def sanitize_level(level) -> str:
+    """Ensure level is a single valid value."""
+    # If it's a list, pick the first valid one
+    if isinstance(level, list):
+        for l in level:
+            if isinstance(l, str) and l.lower() in VALID_LEVELS:
+                return l.lower()
+        return 'masters'  # default
+    
+    # If it's a string, validate it
+    if isinstance(level, str):
+        level_lower = level.lower().strip()
+        if level_lower in VALID_LEVELS:
+            return level_lower
+        # Try to map common variations
+        mapping = {
+            'undergraduate': 'bachelor',
+            'bachelors': 'bachelor',
+            "bachelor's": 'bachelor',
+            'graduate': 'masters',
+            "master's": 'masters',
+            'master': 'masters',
+            'msc': 'masters',
+            'mba': 'masters',
+            'doctoral': 'phd',
+            'doctorate': 'phd',
+            'post-doctoral': 'postdoc',
+            'post-doc': 'postdoc',
+        }
+        return mapping.get(level_lower, 'masters')
+    
+    return 'masters'  # default
+
+def sanitize_funding_type(funding_type) -> str:
+    """Ensure funding_type is a valid value."""
+    if isinstance(funding_type, str):
+        ft_lower = funding_type.lower().strip()
+        if ft_lower in VALID_FUNDING_TYPES:
+            return ft_lower
+        # Map variations
+        if 'full' in ft_lower:
+            return 'full'
+        if 'tuition' in ft_lower:
+            return 'tuition_only'
+        if 'stipend' in ft_lower:
+            return 'stipend_only'
+    return 'partial'  # default
 
 def sanitize_eligibility_rule(rule: dict) -> dict | None:
     """Sanitize eligibility rule to match database constraints. Returns None if invalid."""
@@ -973,8 +1023,8 @@ async def ingest(request: Request, authorization: str = Header(None)):
     program_data = {
         "name": extracted.get("name") or "Unknown Program",
         "provider": extracted.get("provider") or "Unknown",
-        "level": extracted.get("level") or "masters",
-        "funding_type": extracted.get("funding_type") or "partial",
+        "level": sanitize_level(extracted.get("level")),
+        "funding_type": sanitize_funding_type(extracted.get("funding_type")),
         "countries_eligible": extracted.get("countries_eligible") or [],
         "countries_of_study": extracted.get("countries_of_study") or [],
         "fields": extracted.get("fields") or [],
@@ -986,7 +1036,8 @@ async def ingest(request: Request, authorization: str = Header(None)):
         "last_verified_at": datetime.utcnow().isoformat()
     }
     
-    logger.debug(f"Program data prepared: {program_data['name']}")
+    logger.debug(f"Sanitized level: {program_data['level']} (original: {extracted.get('level')})")
+    logger.debug(f"Sanitized funding_type: {program_data['funding_type']} (original: {extracted.get('funding_type')})")
     
     try:
         if ingest_request.program_id:
