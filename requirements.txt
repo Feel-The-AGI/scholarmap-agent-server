@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+supabase
+httpx[http2]
+google-genai
+pydantic
+python-multipart
+playwright
+beautifulsoup4
+lxml
+curl_cffi
+fake-useragent
+cloudscraper
