@@ -1460,3 +1460,299 @@ async def batch_ingest(request: BatchIngestRequest, authorization: str = Header(
 
 
 logger.debug("=== APPLICATION STARTUP COMPLETE ===")
+
+
+# ============================================
+# LLM-POWERED ELIGIBILITY CHECKER
+# ============================================
+
+class UserProfile(BaseModel):
+    nationality: str
+    age: int | None = None
+    degree: str  # Current/highest degree: BSc, BA, MSc, MA, PhD, High School
+    gpa: float | None = None  # GPA on 4.0 scale
+    field_of_study: str | None = None
+    work_experience_years: int = 0
+    languages: list[str] = []  # Languages with proficiency
+    has_financial_need: bool | None = None
+    is_refugee: bool = False
+    has_disability: bool = False
+    additional_info: str | None = None  # Free text for other relevant info
+
+class EligibilityCheckRequest(BaseModel):
+    profile: UserProfile
+
+class ProgramMatch(BaseModel):
+    program_id: str
+    program_name: str
+    provider: str
+    level: str
+    funding_type: str
+    match_score: int  # 0-100
+    status: str  # "eligible", "likely_eligible", "maybe", "unlikely", "not_eligible"
+    explanation: str  # Personalized explanation
+    strengths: list[str]  # What makes them a good fit
+    concerns: list[str]  # Potential issues or missing requirements
+    action_items: list[str]  # What they should do to apply/improve chances
+
+class EligibilityCheckResponse(BaseModel):
+    eligible: list[ProgramMatch]
+    likely_eligible: list[ProgramMatch]
+    maybe: list[ProgramMatch]
+    unlikely: list[ProgramMatch]
+    not_eligible: list[ProgramMatch]
+    total_programs_analyzed: int
+    processing_time: float
+    ai_summary: str  # Overall personalized summary
+
+
+ELIGIBILITY_PROMPT = """You are an expert scholarship advisor. Analyze whether this student is eligible for the given scholarship.
+
+STUDENT PROFILE:
+{profile}
+
+SCHOLARSHIP DETAILS:
+Name: {name}
+Provider: {provider}
+Level: {level}
+Funding: {funding_type}
+Description: {description}
+Countries Eligible: {countries_eligible}
+Countries of Study: {countries_of_study}
+Fields: {fields}
+Who Usually Wins: {who_wins}
+Age Requirements: {age_requirements}
+GPA Requirements: {gpa_requirements}
+Eligibility Rules: {eligibility_rules}
+
+Analyze the match and return ONLY valid JSON:
+{{
+  "match_score": <0-100 integer based on how well they fit>,
+  "status": "<eligible|likely_eligible|maybe|unlikely|not_eligible>",
+  "explanation": "<2-3 sentence personalized explanation addressing the student directly>",
+  "strengths": ["<specific reasons why they're a good fit>"],
+  "concerns": ["<specific issues or missing requirements>"],
+  "action_items": ["<specific next steps they should take>"]
+}}
+
+SCORING GUIDELINES:
+- 90-100: Perfect match - meets all criteria, strong candidate
+- 75-89: Likely eligible - meets most criteria, minor gaps
+- 50-74: Maybe - meets some criteria but significant uncertainties
+- 25-49: Unlikely - major gaps but not completely disqualified
+- 0-24: Not eligible - hard disqualifiers present
+
+Be INTELLIGENT about:
+1. Nationality matching - "African countries" includes Nigeria, Ghana, Kenya, etc.
+2. Regional understanding - "Sub-Saharan Africa" is a region containing specific countries
+3. Degree equivalence - BSc/BA are bachelor's, MSc/MA are master's
+4. Field matching - "STEM" includes Computer Science, Engineering, Physics, etc.
+5. Special circumstances - refugees, disabilities often get priority
+6. Financial need - if the scholarship targets underprivileged students
+
+Be ENCOURAGING but HONEST. If there's a hard disqualifier (wrong nationality, wrong degree level), be clear about it.
+"""
+
+
+async def analyze_eligibility_batch(profile: UserProfile, programs: list[dict]) -> list[ProgramMatch]:
+    """Analyze eligibility for multiple programs using LLM."""
+    results = []
+    
+    # Format the user profile nicely
+    profile_text = f"""
+- Nationality: {profile.nationality}
+- Age: {profile.age or 'Not specified'}
+- Education: {profile.degree}
+- GPA: {profile.gpa or 'Not specified'}
+- Field of Study: {profile.field_of_study or 'Not specified'}
+- Work Experience: {profile.work_experience_years} years
+- Languages: {', '.join(profile.languages) if profile.languages else 'Not specified'}
+- Financial Need: {'Yes' if profile.has_financial_need else 'Not specified' if profile.has_financial_need is None else 'No'}
+- Refugee/Displaced: {'Yes' if profile.is_refugee else 'No'}
+- Disability: {'Yes' if profile.has_disability else 'No'}
+- Additional Info: {profile.additional_info or 'None'}
+"""
+    
+    for program in programs:
+        try:
+            # Build eligibility rules text
+            rules_text = "None specified"
+            if program.get('eligibility_rules'):
+                rules = program['eligibility_rules']
+                if isinstance(rules, list) and rules:
+                    rules_text = "\n".join([
+                        f"- {r.get('rule_type', 'other')}: {r.get('value', {})} (confidence: {r.get('confidence', 'unknown')})"
+                        for r in rules
+                    ])
+            
+            # Format age requirements
+            age_req = "Not specified"
+            if program.get('age_min') or program.get('age_max'):
+                if program.get('age_min') and program.get('age_max'):
+                    age_req = f"{program['age_min']}-{program['age_max']} years"
+                elif program.get('age_max'):
+                    age_req = f"Up to {program['age_max']} years"
+                else:
+                    age_req = f"{program['age_min']}+ years"
+            
+            # Format GPA requirements
+            gpa_req = "Not specified"
+            if program.get('gpa_min'):
+                gpa_req = f"Minimum {program['gpa_min']} GPA"
+            
+            prompt = ELIGIBILITY_PROMPT.format(
+                profile=profile_text,
+                name=program.get('name', 'Unknown'),
+                provider=program.get('provider', 'Unknown'),
+                level=program.get('level', 'Unknown'),
+                funding_type=program.get('funding_type', 'Unknown'),
+                description=program.get('description') or 'No description available',
+                countries_eligible=', '.join(program.get('countries_eligible', [])) or 'Not specified',
+                countries_of_study=', '.join(program.get('countries_of_study', [])) or 'Not specified',
+                fields=', '.join(program.get('fields', [])) or 'All fields',
+                who_wins=program.get('who_wins') or 'Not specified',
+                age_requirements=age_req,
+                gpa_requirements=gpa_req,
+                eligibility_rules=rules_text
+            )
+            
+            response = gemini_client.models.generate_content(
+                model="gemini-2.5-pro-preview-05-06",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=1024,
+                    temperature=0.3  # Lower temperature for more consistent scoring
+                )
+            )
+            
+            result_text = response.text.strip()
+            # Clean markdown if present
+            if result_text.startswith("```"):
+                result_text = result_text.split("```")[1]
+                if result_text.startswith("json"):
+                    result_text = result_text[4:]
+            result_text = result_text.strip()
+            
+            analysis = json.loads(result_text)
+            
+            results.append(ProgramMatch(
+                program_id=program['id'],
+                program_name=program.get('name', 'Unknown'),
+                provider=program.get('provider', 'Unknown'),
+                level=program.get('level', 'unknown'),
+                funding_type=program.get('funding_type', 'unknown'),
+                match_score=min(100, max(0, int(analysis.get('match_score', 50)))),
+                status=analysis.get('status', 'maybe'),
+                explanation=analysis.get('explanation', 'Unable to analyze this program.'),
+                strengths=analysis.get('strengths', []),
+                concerns=analysis.get('concerns', []),
+                action_items=analysis.get('action_items', [])
+            ))
+            
+        except Exception as e:
+            logger.error(f"Error analyzing program {program.get('id')}: {e}")
+            # Add with default values on error
+            results.append(ProgramMatch(
+                program_id=program['id'],
+                program_name=program.get('name', 'Unknown'),
+                provider=program.get('provider', 'Unknown'),
+                level=program.get('level', 'unknown'),
+                funding_type=program.get('funding_type', 'unknown'),
+                match_score=50,
+                status='maybe',
+                explanation='We couldn\'t fully analyze this program. Please review the details manually.',
+                strengths=[],
+                concerns=['Automated analysis unavailable'],
+                action_items=['Review program requirements directly on their website']
+            ))
+    
+    return results
+
+
+@app.post("/check-eligibility", response_model=EligibilityCheckResponse)
+async def check_eligibility(request: EligibilityCheckRequest):
+    """
+    LLM-powered intelligent eligibility checker.
+    Analyzes user profile against all active scholarships using AI.
+    """
+    import time
+    start_time = time.time()
+    
+    logger.info(f"=== ELIGIBILITY CHECK START ===")
+    logger.info(f"Profile: {request.profile.nationality}, {request.profile.degree}")
+    
+    supabase = get_supabase()
+    
+    # Fetch all active programs with their eligibility rules
+    result = supabase.table("programs").select(
+        "id, name, provider, level, funding_type, description, "
+        "countries_eligible, countries_of_study, fields, who_wins, "
+        "age_min, age_max, gpa_min, eligibility_rules(*)"
+    ).eq("status", "active").execute()
+    
+    programs = result.data or []
+    logger.info(f"Found {len(programs)} active programs to analyze")
+    
+    if not programs:
+        return EligibilityCheckResponse(
+            eligible=[],
+            likely_eligible=[],
+            maybe=[],
+            unlikely=[],
+            not_eligible=[],
+            total_programs_analyzed=0,
+            processing_time=time.time() - start_time,
+            ai_summary="No active scholarship programs found in our database."
+        )
+    
+    # Analyze all programs
+    matches = await analyze_eligibility_batch(request.profile, programs)
+    
+    # Sort by match score
+    matches.sort(key=lambda x: x.match_score, reverse=True)
+    
+    # Categorize results
+    eligible = [m for m in matches if m.status == 'eligible']
+    likely_eligible = [m for m in matches if m.status == 'likely_eligible']
+    maybe = [m for m in matches if m.status == 'maybe']
+    unlikely = [m for m in matches if m.status == 'unlikely']
+    not_eligible = [m for m in matches if m.status == 'not_eligible']
+    
+    processing_time = time.time() - start_time
+    
+    # Generate overall summary
+    total_good = len(eligible) + len(likely_eligible)
+    summary_prompt = f"""Based on the analysis of {len(programs)} scholarships for a student from {request.profile.nationality} 
+with a {request.profile.degree} degree, {total_good} scholarships look promising.
+
+Write a 2-3 sentence encouraging and personalized summary for them. Be specific about their opportunities.
+Return ONLY the summary text, no JSON."""
+    
+    try:
+        summary_response = gemini_client.models.generate_content(
+            model="gemini-2.5-pro-preview-05-06",
+            contents=summary_prompt,
+            config=types.GenerateContentConfig(max_output_tokens=200)
+        )
+        ai_summary = summary_response.text.strip()
+    except:
+        if total_good > 0:
+            ai_summary = f"Great news! We found {total_good} scholarship{'s' if total_good != 1 else ''} that match your profile well. Your background and qualifications open up some exciting opportunities."
+        else:
+            ai_summary = f"While we didn't find perfect matches, there are {len(maybe)} scholarships worth exploring. Don't give up - many successful scholars didn't fit traditional profiles."
+    
+    logger.info(f"=== ELIGIBILITY CHECK COMPLETE ===")
+    logger.info(f"Results: {len(eligible)} eligible, {len(likely_eligible)} likely, {len(maybe)} maybe, {len(not_eligible)} not eligible")
+    logger.info(f"Processing time: {processing_time:.2f}s")
+    
+    return EligibilityCheckResponse(
+        eligible=eligible,
+        likely_eligible=likely_eligible,
+        maybe=maybe,
+        unlikely=unlikely,
+        not_eligible=not_eligible,
+        total_programs_analyzed=len(programs),
+        processing_time=processing_time,
+        ai_summary=ai_summary
+    )
