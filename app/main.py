@@ -1242,7 +1242,7 @@ async def process_single_url(url: str, supabase: Client) -> BatchItemResult:
     start_time = time.time()
     
     try:
-        logger.info(f"[BATCH] Processing: {url}")
+        logger.debug(f"[BATCH] Processing: {url}")
         
         # Validate URL
         if not url.startswith(('http://', 'https://')):
@@ -1376,7 +1376,7 @@ async def process_single_url(url: str, supabase: Client) -> BatchItemResult:
                     "severity": "high" if confidence < 0.5 else "low"
                 }).execute()
             
-            logger.info(f"[BATCH] Success: {url} -> {program_id}")
+            logger.debug(f"[BATCH] Success: {url} -> {program_id}")
             return BatchItemResult(
                 url=url,
                 success=True,
@@ -1413,8 +1413,8 @@ async def batch_ingest(request: BatchIngestRequest, authorization: str = Header(
     import time
     start_time = time.time()
     
-    logger.info(f"=== BATCH INGEST START ===")
-    logger.info(f"URLs to process: {len(request.urls)}")
+    logger.debug(f"=== BATCH INGEST START ===")
+    logger.debug(f"URLs to process: {len(request.urls)}")
     
     verify_token(authorization)
     
@@ -1447,8 +1447,8 @@ async def batch_ingest(request: BatchIngestRequest, authorization: str = Header(
     failed = len(results) - successful
     total_time = time.time() - start_time
     
-    logger.info(f"=== BATCH INGEST COMPLETE ===")
-    logger.info(f"Total: {len(results)}, Success: {successful}, Failed: {failed}, Time: {total_time:.2f}s")
+    logger.debug(f"=== BATCH INGEST COMPLETE ===")
+    logger.debug(f"Total: {len(results)}, Success: {successful}, Failed: {failed}, Time: {total_time:.2f}s")
     
     return BatchIngestResponse(
         total=len(results),
