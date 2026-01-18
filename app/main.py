@@ -1257,7 +1257,7 @@ async def process_single_url(url: str, supabase: Client) -> BatchItemResult:
         
         # Fetch content using resilient scraper
         try:
-            content = await resilient_scrape(url)
+            content = await fetch_page_content(url)
             if not content or len(content) < 100:
                 return BatchItemResult(
                     url=url,
