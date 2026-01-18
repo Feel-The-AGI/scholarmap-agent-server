@@ -142,6 +142,26 @@ class IngestResponse(BaseModel):
     confidence: float
     issues: list[str]
 
+# Batch processing models
+class BatchIngestRequest(BaseModel):
+    urls: list[str]  # List of URLs to process
+    
+class BatchItemResult(BaseModel):
+    url: str
+    success: bool
+    program_id: str | None = None
+    confidence: float = 0.0
+    issues: list[str] = []
+    error: str | None = None
+    processing_time: float = 0.0
+
+class BatchIngestResponse(BaseModel):
+    total: int
+    successful: int
+    failed: int
+    results: list[BatchItemResult]
+    total_time: float
+
 EXTRACTION_PROMPT = """You are a scholarship data extraction expert. Analyze this scholarship webpage and extract ALL available information.
 
 Return ONLY valid JSON with this EXACT structure (fill ALL fields, use null if not found):
@@ -1003,7 +1023,7 @@ def extract_with_gemini(content: str) -> dict:
         raise Exception("Gemini client not initialized")
     
     response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-pro",
         contents=f"{EXTRACTION_PROMPT}\n\nWebpage content:\n{content}",
         config=types.GenerateContentConfig(
             response_mime_type="application/json"
@@ -1169,7 +1189,7 @@ async def ingest(request: Request, authorization: str = Header(None)):
         supabase.table("sources").insert({
             "program_id": program_id,
             "url": str(ingest_request.url),
-            "agent_model": "gemini-2.5-flash",
+            "agent_model": "gemini-2.5-pro",
             "raw_summary": json.dumps(extracted)[:10000],
             "confidence_score": confidence
         }).execute()
@@ -1209,5 +1229,233 @@ async def recheck(program_id: str, authorization: str = Header(None)):
     from fastapi import Request as FastAPIRequest
     # This is a bit hacky but works for recheck
     return {"message": "Use /ingest endpoint directly with program_id parameter"}
+
+
+# ==================== BATCH PROCESSING ====================
+# Lightning-fast concurrent URL processing
+# =========================================================
+
+async def process_single_url(url: str, supabase: Client) -> BatchItemResult:
+    """Process a single URL and return result. Handles all errors gracefully."""
+    import time
+    start_time = time.time()
+    
+    try:
+        logger.info(f"[BATCH] Processing: {url}")
+        
+        # Validate URL
+        if not url.startswith(('http://', 'https://')):
+            return BatchItemResult(
+                url=url,
+                success=False,
+                error="Invalid URL format",
+                processing_time=time.time() - start_time
+            )
+        
+        issues = []
+        
+        # Fetch content using resilient scraper
+        try:
+            content = await resilient_scrape(url)
+            if not content or len(content) < 100:
+                return BatchItemResult(
+                    url=url,
+                    success=False,
+                    error="Failed to fetch page content or page too short",
+                    processing_time=time.time() - start_time
+                )
+        except Exception as e:
+            return BatchItemResult(
+                url=url,
+                success=False,
+                error=f"Scraping failed: {str(e)}",
+                processing_time=time.time() - start_time
+            )
+        
+        # Extract with Gemini
+        try:
+            extracted = extract_with_gemini(content)
+        except Exception as e:
+            return BatchItemResult(
+                url=url,
+                success=False,
+                error=f"AI extraction failed: {str(e)}",
+                processing_time=time.time() - start_time
+            )
+        
+        confidence = extracted.get("confidence_score", 0.5)
+        issues.extend(extracted.get("issues", []))
+        
+        if confidence < 0.5:
+            issues.append("Low confidence extraction - manual review recommended")
+        
+        # Build program data
+        program_data = {
+            "name": extracted.get("name") or "Unknown Program",
+            "provider": extracted.get("provider") or "Unknown",
+            "level": sanitize_level(extracted.get("level")),
+            "funding_type": sanitize_funding_type(extracted.get("funding_type")),
+            "countries_eligible": extracted.get("countries_eligible") or [],
+            "countries_of_study": extracted.get("countries_of_study") or [],
+            "fields": extracted.get("fields") or [],
+            "official_url": url,
+            "description": extracted.get("description"),
+            "who_wins": extracted.get("who_wins"),
+            "rejection_reasons": extracted.get("rejection_reasons"),
+            "status": "active",
+            "last_verified_at": datetime.utcnow().isoformat(),
+            # Enhanced fields
+            "application_url": extracted.get("application_url"),
+            "benefits": extracted.get("benefits") or {},
+            "contact_email": extracted.get("contact_email"),
+            "host_institution": extracted.get("host_institution"),
+            "duration": extracted.get("duration"),
+            "age_min": sanitize_int(extracted.get("age_min")),
+            "age_max": sanitize_int(extracted.get("age_max")),
+            "gpa_min": sanitize_float(extracted.get("gpa_min")),
+            "language_requirements": extracted.get("language_requirements") or [],
+            "award_amount": extracted.get("award_amount"),
+            "number_of_awards": sanitize_int(extracted.get("number_of_awards")),
+            "is_renewable": bool(extracted.get("is_renewable")) if extracted.get("is_renewable") is not None else None
+        }
+        
+        # Insert into database
+        try:
+            result = supabase.table("programs").insert(program_data).execute()
+            program_id = result.data[0]["id"]
+            
+            # Insert related data
+            for rule in extracted.get("eligibility_rules", []):
+                sanitized = sanitize_eligibility_rule(rule)
+                if sanitized:
+                    supabase.table("eligibility_rules").insert({
+                        "program_id": program_id,
+                        "rule_type": sanitized["rule_type"],
+                        "operator": sanitized["operator"],
+                        "value": sanitized["value"],
+                        "confidence": sanitized["confidence"],
+                        "source_snippet": sanitized["source_snippet"]
+                    }).execute()
+            
+            for req in extracted.get("requirements", []):
+                sanitized = sanitize_requirement(req)
+                if sanitized:
+                    supabase.table("requirements").insert({
+                        "program_id": program_id,
+                        "type": sanitized["type"],
+                        "description": sanitized["description"],
+                        "mandatory": sanitized["mandatory"]
+                    }).execute()
+            
+            for deadline in extracted.get("deadlines", []):
+                sanitized = sanitize_deadline(deadline)
+                if sanitized and sanitized.get("deadline_date"):
+                    supabase.table("deadlines").insert({
+                        "program_id": program_id,
+                        "cycle": sanitized["cycle"],
+                        "deadline_date": sanitized["deadline_date"],
+                        "stage": sanitized["stage"]
+                    }).execute()
+            
+            # Insert source
+            supabase.table("sources").insert({
+                "program_id": program_id,
+                "url": url,
+                "agent_model": "gemini-2.5-pro",
+                "raw_summary": json.dumps(extracted)[:10000],
+                "confidence_score": confidence
+            }).execute()
+            
+            # Insert reviews if issues
+            for issue in issues:
+                supabase.table("agent_reviews").insert({
+                    "program_id": program_id,
+                    "issue_type": "suspicious" if confidence < 0.5 else "missing_data",
+                    "note": issue,
+                    "severity": "high" if confidence < 0.5 else "low"
+                }).execute()
+            
+            logger.info(f"[BATCH] Success: {url} -> {program_id}")
+            return BatchItemResult(
+                url=url,
+                success=True,
+                program_id=program_id,
+                confidence=confidence,
+                issues=issues,
+                processing_time=time.time() - start_time
+            )
+            
+        except Exception as e:
+            return BatchItemResult(
+                url=url,
+                success=False,
+                error=f"Database error: {str(e)}",
+                processing_time=time.time() - start_time
+            )
+            
+    except Exception as e:
+        logger.error(f"[BATCH] Unexpected error for {url}: {e}")
+        return BatchItemResult(
+            url=url,
+            success=False,
+            error=f"Unexpected error: {str(e)}",
+            processing_time=time.time() - start_time
+        )
+
+
+@app.post("/batch-ingest", response_model=BatchIngestResponse)
+async def batch_ingest(request: BatchIngestRequest, authorization: str = Header(None)):
+    """
+    Batch ingest multiple scholarship URLs concurrently.
+    Process up to 10 URLs in parallel for optimal performance.
+    """
+    import time
+    start_time = time.time()
+    
+    logger.info(f"=== BATCH INGEST START ===")
+    logger.info(f"URLs to process: {len(request.urls)}")
+    
+    verify_token(authorization)
+    
+    # Validate and clean URLs
+    urls = [url.strip() for url in request.urls if url.strip()]
+    
+    if not urls:
+        raise HTTPException(status_code=400, detail="No valid URLs provided")
+    
+    if len(urls) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 URLs per batch")
+    
+    supabase = get_supabase()
+    
+    # Process URLs concurrently with semaphore to limit concurrency
+    semaphore = asyncio.Semaphore(5)  # Max 5 concurrent
+    
+    async def process_with_semaphore(url: str) -> BatchItemResult:
+        async with semaphore:
+            return await process_single_url(url, supabase)
+    
+    # Execute all concurrently
+    results = await asyncio.gather(
+        *[process_with_semaphore(url) for url in urls],
+        return_exceptions=False
+    )
+    
+    # Calculate stats
+    successful = sum(1 for r in results if r.success)
+    failed = len(results) - successful
+    total_time = time.time() - start_time
+    
+    logger.info(f"=== BATCH INGEST COMPLETE ===")
+    logger.info(f"Total: {len(results)}, Success: {successful}, Failed: {failed}, Time: {total_time:.2f}s")
+    
+    return BatchIngestResponse(
+        total=len(results),
+        successful=successful,
+        failed=failed,
+        results=results,
+        total_time=total_time
+    )
+
 
 logger.debug("=== APPLICATION STARTUP COMPLETE ===")
