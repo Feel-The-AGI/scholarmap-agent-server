@@ -1026,7 +1026,8 @@ def extract_with_gemini(content: str) -> dict:
         model="gemini-2.5-pro",
         contents=f"{EXTRACTION_PROMPT}\n\nWebpage content:\n{content}",
         config=types.GenerateContentConfig(
-            response_mime_type="application/json"
+            response_mime_type="application/json",
+            max_output_tokens=32768  # 32k tokens to prevent cutoff
         )
     )
     logger.debug(f"Gemini response received, text length: {len(response.text)}")
