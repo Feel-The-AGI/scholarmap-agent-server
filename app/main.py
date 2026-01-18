@@ -142,47 +142,73 @@ class IngestResponse(BaseModel):
     confidence: float
     issues: list[str]
 
-EXTRACTION_PROMPT = """You are analyzing a scholarship/fellowship program webpage. Extract structured data.
+EXTRACTION_PROMPT = """You are a scholarship data extraction expert. Analyze this scholarship webpage and extract ALL available information.
 
-Return ONLY valid JSON with this exact structure:
+Return ONLY valid JSON with this EXACT structure (fill ALL fields, use null if not found):
 {
-  "name": "Program name",
-  "provider": "Organization offering this",
+  "name": "Full program/scholarship name",
+  "provider": "Organization offering the scholarship (e.g. Gates Foundation, Chevening)",
+  "host_institution": "University or institution where study takes place (e.g. University of Cambridge)",
   "level": "bachelor" | "masters" | "phd" | "postdoc",
   "funding_type": "full" | "partial" | "tuition_only" | "stipend_only",
-  "countries_eligible": ["country1", "country2"],
-  "countries_of_study": ["country1"],
-  "fields": ["field1", "field2"],
-  "description": "Brief description",
-  "who_wins": "Profile of typical winners",
-  "rejection_reasons": "Common reasons for rejection",
+  "countries_eligible": ["List of countries whose citizens can apply"],
+  "countries_of_study": ["Countries where the program takes place"],
+  "fields": ["Eligible fields of study"],
+  "description": "Comprehensive description of the scholarship (2-4 sentences)",
+  "who_wins": "Profile of successful applicants - background, achievements, characteristics",
+  "rejection_reasons": "Common reasons applications are rejected",
+  "application_url": "Direct URL to apply (if different from info page)",
+  "benefits": {
+    "tuition": true,
+    "stipend": "Monthly amount if stated e.g. $2,000/month",
+    "housing": true,
+    "travel": "Flight allowance if any",
+    "insurance": true,
+    "other": "Any other benefits"
+  },
+  "award_amount": "Total value if stated e.g. $50,000/year or Full scholarship",
+  "number_of_awards": 100,
+  "is_renewable": true,
+  "duration": "Program duration e.g. 2 years, 4 semesters",
+  "age_min": 18,
+  "age_max": 35,
+  "gpa_min": 3.0,
+  "language_requirements": ["IELTS 7.0", "TOEFL 100"],
+  "contact_email": "contact@scholarship.org",
   "eligibility_rules": [
-    {"rule_type": "gpa", "operator": ">=", "value": {"min": 3.0}, "confidence": "high", "source_snippet": "quote from page"},
-    {"rule_type": "nationality", "operator": "in", "value": {"countries": ["Ghana", "Nigeria"]}, "confidence": "high", "source_snippet": "quote"}
+    {"rule_type": "gpa", "operator": ">=", "value": {"min": 3.0}, "confidence": "high", "source_snippet": "exact quote from page"},
+    {"rule_type": "nationality", "operator": "in", "value": {"countries": ["Ghana", "Nigeria"]}, "confidence": "high", "source_snippet": "quote"},
+    {"rule_type": "age", "operator": "<=", "value": {"max": 35}, "confidence": "medium", "source_snippet": "quote"}
   ],
   "requirements": [
-    {"type": "transcript", "description": "Official transcripts", "mandatory": true},
-    {"type": "essay", "description": "500-word personal statement", "mandatory": true}
+    {"type": "transcript", "description": "Official academic transcripts", "mandatory": true},
+    {"type": "essay", "description": "Personal statement (500-1000 words)", "mandatory": true},
+    {"type": "references", "description": "2 academic references", "mandatory": true},
+    {"type": "cv", "description": "Curriculum Vitae", "mandatory": true}
   ],
   "deadlines": [
     {"cycle": "2025/2026", "deadline_date": "2025-11-15", "stage": "application"}
   ],
   "confidence_score": 0.85,
-  "issues": ["Any concerns about data quality"]
+  "issues": ["List any concerns about data quality or missing information"]
 }
 
-Rules:
-- level must be exactly: bachelor, masters, phd, or postdoc
-- funding_type must be exactly: full, partial, tuition_only, or stipend_only
-- rule_type must be: gpa, degree, nationality, age, work_experience, language, or other
-- operator MUST be exactly one of: =, >=, <=, >, <, in, not_in, exists, between (NO OTHER VALUES)
-- requirement type must be: transcript, cv, essay, references, proposal, test, interview, or other
-- stage must be: application, interview, nomination, or result
-- confidence must be: high, medium, or inferred
-- confidence_score is 0-1 overall extraction confidence
-- Include source_snippet for eligibility rules when possible
+STRICT RULES:
+1. level MUST be exactly one of: bachelor, masters, phd, postdoc (pick ONE, not multiple)
+2. funding_type MUST be: full, partial, tuition_only, or stipend_only
+3. rule_type MUST be: gpa, degree, nationality, age, work_experience, language, or other
+4. operator MUST be: =, >=, <=, >, <, in, not_in, exists, between (NOTHING ELSE)
+5. requirement type MUST be: transcript, cv, essay, references, proposal, test, interview, or other
+6. stage MUST be: application, interview, nomination, or result
+7. confidence MUST be: high, medium, or inferred
+8. confidence_score is 0-1 indicating overall extraction quality
+9. Include source_snippet with EXACT quotes from the page
+10. If a program covers multiple levels (e.g. Masters AND PhD), pick the HIGHEST level
+11. ALL date formats must be YYYY-MM-DD
+12. Extract EVERY requirement mentioned on the page
+13. If info is unclear, use null but ALWAYS include the field
 
-If information is not clearly stated, omit it or mark confidence as "inferred".
+Be thorough - extract EVERYTHING. This data will be used to match students with scholarships.
 """
 
 # Valid values for database constraints
@@ -241,6 +267,40 @@ def sanitize_funding_type(funding_type) -> str:
         if 'stipend' in ft_lower:
             return 'stipend_only'
     return 'partial'  # default
+
+def sanitize_int(value) -> int | None:
+    """Safely convert value to integer."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            # Extract first number from string
+            import re
+            match = re.search(r'\d+', value)
+            if match:
+                return int(match.group())
+        return None
+    except:
+        return None
+
+def sanitize_float(value) -> float | None:
+    """Safely convert value to float."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return round(float(value), 2)
+        if isinstance(value, str):
+            # Extract first decimal from string
+            import re
+            match = re.search(r'\d+\.?\d*', value)
+            if match:
+                return round(float(match.group()), 2)
+        return None
+    except:
+        return None
 
 def sanitize_eligibility_rule(rule: dict) -> dict | None:
     """Sanitize eligibility rule to match database constraints. Returns None if invalid."""
@@ -1033,7 +1093,20 @@ async def ingest(request: Request, authorization: str = Header(None)):
         "who_wins": extracted.get("who_wins"),
         "rejection_reasons": extracted.get("rejection_reasons"),
         "status": "active",
-        "last_verified_at": datetime.utcnow().isoformat()
+        "last_verified_at": datetime.utcnow().isoformat(),
+        # New enhanced fields
+        "application_url": extracted.get("application_url"),
+        "benefits": extracted.get("benefits") or {},
+        "contact_email": extracted.get("contact_email"),
+        "host_institution": extracted.get("host_institution"),
+        "duration": extracted.get("duration"),
+        "age_min": sanitize_int(extracted.get("age_min")),
+        "age_max": sanitize_int(extracted.get("age_max")),
+        "gpa_min": sanitize_float(extracted.get("gpa_min")),
+        "language_requirements": extracted.get("language_requirements") or [],
+        "award_amount": extracted.get("award_amount"),
+        "number_of_awards": sanitize_int(extracted.get("number_of_awards")),
+        "is_renewable": bool(extracted.get("is_renewable")) if extracted.get("is_renewable") is not None else None
     }
     
     logger.debug(f"Sanitized level: {program_data['level']} (original: {extracted.get('level')})")
