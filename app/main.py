@@ -1470,6 +1470,7 @@ class UserProfile(BaseModel):
     nationality: str
     age: int | None = None
     degree: str  # Current/highest degree: BSc, BA, MSc, MA, PhD, High School
+    target_degree: str | None = None  # What they're looking for: bachelor, masters, phd, postdoc
     gpa: float | None = None  # GPA on 4.0 scale
     field_of_study: str | None = None
     work_experience_years: int = 0
@@ -1514,7 +1515,7 @@ STUDENT PROFILE:
 SCHOLARSHIP DETAILS:
 Name: {name}
 Provider: {provider}
-Level: {level}
+Program Level: {level} (This is the degree level the scholarship offers)
 Funding: {funding_type}
 Description: {description}
 Countries Eligible: {countries_eligible}
@@ -1535,22 +1536,30 @@ Analyze the match and return ONLY valid JSON:
   "action_items": ["<specific next steps they should take>"]
 }}
 
+CRITICAL - DEGREE LEVEL MATCHING:
+- The student is looking for a {target_degree_upper} scholarship
+- The scholarship offers: {level}
+- If these DON'T match, this is a HARD DISQUALIFIER (score 0-24, status: not_eligible)
+- Bachelor's student looking for Master's = WRONG (unless this IS a Master's program)
+- Master's student looking for PhD = WRONG (unless this IS a PhD program)
+
 SCORING GUIDELINES:
 - 90-100: Perfect match - meets all criteria, strong candidate
 - 75-89: Likely eligible - meets most criteria, minor gaps
 - 50-74: Maybe - meets some criteria but significant uncertainties
 - 25-49: Unlikely - major gaps but not completely disqualified
-- 0-24: Not eligible - hard disqualifiers present
+- 0-24: Not eligible - hard disqualifiers present (wrong degree level, wrong nationality)
 
 Be INTELLIGENT about:
-1. Nationality matching - "African countries" includes Nigeria, Ghana, Kenya, etc.
-2. Regional understanding - "Sub-Saharan Africa" is a region containing specific countries
-3. Degree equivalence - BSc/BA are bachelor's, MSc/MA are master's
-4. Field matching - "STEM" includes Computer Science, Engineering, Physics, etc.
-5. Special circumstances - refugees, disabilities often get priority
-6. Financial need - if the scholarship targets underprivileged students
+1. DEGREE LEVEL - Most important! If student wants Master's but scholarship is for Bachelor's, they're NOT eligible
+2. Nationality matching - "African countries" includes Nigeria, Ghana, Kenya, etc.
+3. Regional understanding - "Sub-Saharan Africa" is a region containing specific countries
+4. Degree equivalence - BSc/BA are bachelor's, MSc/MA are master's
+5. Field matching - "STEM" includes Computer Science, Engineering, Physics, etc.
+6. Special circumstances - refugees, disabilities often get priority
+7. Financial need - if the scholarship targets underprivileged students
 
-Be ENCOURAGING but HONEST. If there's a hard disqualifier (wrong nationality, wrong degree level), be clear about it.
+Be ENCOURAGING but HONEST. If there's a hard disqualifier (wrong degree level, wrong nationality), be clear about it.
 """
 
 
@@ -1559,10 +1568,18 @@ async def analyze_eligibility_batch(profile: UserProfile, programs: list[dict]) 
     results = []
     
     # Format the user profile nicely
+    target_degree_label = {
+        'bachelor': "Bachelor's degree",
+        'masters': "Master's degree",
+        'phd': "PhD/Doctorate",
+        'postdoc': "Postdoctoral fellowship"
+    }.get(profile.target_degree, profile.target_degree or 'Not specified')
+    
     profile_text = f"""
 - Nationality: {profile.nationality}
 - Age: {profile.age or 'Not specified'}
-- Education: {profile.degree}
+- Current Education: {profile.degree}
+- LOOKING FOR: {target_degree_label} scholarship
 - GPA: {profile.gpa or 'Not specified'}
 - Field of Study: {profile.field_of_study or 'Not specified'}
 - Work Experience: {profile.work_experience_years} years
@@ -1613,7 +1630,8 @@ async def analyze_eligibility_batch(profile: UserProfile, programs: list[dict]) 
                 who_wins=program.get('who_wins') or 'Not specified',
                 age_requirements=age_req,
                 gpa_requirements=gpa_req,
-                eligibility_rules=rules_text
+                eligibility_rules=rules_text,
+                target_degree_upper=target_degree_label.upper()
             )
             
             response = gemini_client.models.generate_content(
