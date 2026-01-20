@@ -1943,7 +1943,7 @@ async def onboarding_chat(request: OnboardingChatRequest):
 
 class TTSRequest(BaseModel):
     text: str
-    voice: str = "Aoede"  # Default to warm female voice for Ada
+    voice: str = "Kore"  # Default to Kore (confirmed working female voice)
     style: str | None = None  # Optional style instruction like "warmly and encouragingly"
 
 class TTSResponse(BaseModel):
@@ -1951,11 +1951,10 @@ class TTSResponse(BaseModel):
     format: str = "pcm"
     sample_rate: int = 24000
     
-# Available female voices for Ada (from Gemini TTS):
-# - Aoede: Warm, friendly, conversational
-# - Kore: Professional, clear
-# - Leda: Gentle, nurturing
-# - Zephyr: Bright, energetic
+# Available voices for Ada (from Gemini TTS docs):
+# Female: Kore, Aoede, Leda, Zephyr, Charon, Fenrir
+# Male: Puck, Orus, etc.
+# Using Kore as default - confirmed working in Google's official examples
 
 @app.post("/tts", response_model=TTSResponse)
 async def text_to_speech(request: TTSRequest):
@@ -1966,55 +1965,83 @@ async def text_to_speech(request: TTSRequest):
         logger.error("Gemini client not initialized")
         raise HTTPException(status_code=500, detail="TTS service unavailable")
     
-    try:
-        # Build the TTS prompt with optional style instruction
-        if request.style:
-            tts_prompt = f"Say {request.style}: {request.text}"
-        else:
-            # Default warm, friendly style for Ada
-            tts_prompt = f"Say warmly and conversationally: {request.text}"
-        
-        logger.debug(f"TTS prompt: {tts_prompt[:100]}...")
-        
-        # Call Gemini 2.5 Flash TTS
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash-preview-tts",
-            contents=tts_prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name=request.voice,
-                        )
+    # Retry logic for transient Google API errors
+    max_retries = 3
+    retry_delay = 1.0
+    last_error = None
+    
+    # Voices to try in order (fallback if first fails)
+    voices_to_try = [request.voice, "Kore", "Puck"]  # Kore and Puck confirmed in docs
+    
+    for attempt in range(max_retries):
+        for voice_name in voices_to_try:
+            try:
+                # Build the TTS prompt with optional style instruction
+                if request.style:
+                    tts_prompt = f"Say {request.style}: {request.text}"
+                else:
+                    # Default warm, friendly style for Ada
+                    tts_prompt = f"Say cheerfully and warmly: {request.text}"
+                
+                logger.debug(f"TTS attempt {attempt + 1}, voice={voice_name}: {tts_prompt[:50]}...")
+                
+                # Call Gemini 2.5 Flash TTS
+                response = gemini_client.models.generate_content(
+                    model="gemini-2.5-flash-preview-tts",
+                    contents=tts_prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                    voice_name=voice_name,
+                                )
+                            )
+                        ),
                     )
-                ),
-            )
-        )
+                )
+                
+                # Extract audio data
+                if response.candidates and response.candidates[0].content.parts:
+                    audio_data = response.candidates[0].content.parts[0].inline_data.data
+                    
+                    # Encode to base64 if bytes
+                    import base64
+                    if isinstance(audio_data, bytes):
+                        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                    else:
+                        audio_base64 = audio_data
+                    
+                    logger.info(f"TTS generated: {len(audio_base64)} chars, voice={voice_name}")
+                    
+                    return TTSResponse(
+                        audio_base64=audio_base64,
+                        format="pcm",
+                        sample_rate=24000
+                    )
+                else:
+                    logger.warning(f"No audio data in response for voice {voice_name}")
+                    continue  # Try next voice
+                    
+            except Exception as e:
+                error_str = str(e)
+                logger.warning(f"TTS attempt {attempt + 1} with voice {voice_name} failed: {error_str}")
+                last_error = e
+                
+                # If it's a 500 error from Google, try next voice immediately
+                if "500" in error_str or "INTERNAL" in error_str:
+                    continue  # Try next voice
+                
+                # For other errors, break inner loop and retry
+                break
         
-        # Extract audio data (base64 encoded)
-        if response.candidates and response.candidates[0].content.parts:
-            audio_data = response.candidates[0].content.parts[0].inline_data.data
-            
-            # The data is already base64 encoded from Gemini
-            import base64
-            if isinstance(audio_data, bytes):
-                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-            else:
-                audio_base64 = audio_data  # Already base64 string
-            
-            logger.info(f"TTS generated: {len(audio_base64)} chars of base64 audio")
-            
-            return TTSResponse(
-                audio_base64=audio_base64,
-                format="pcm",
-                sample_rate=24000
-            )
-        else:
-            logger.error("No audio data in TTS response")
-            raise HTTPException(status_code=500, detail="No audio generated")
-            
-    except Exception as e:
-        logger.error(f"TTS error: {e}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")
+        # Wait before next retry attempt
+        if attempt < max_retries - 1:
+            import asyncio
+            await asyncio.sleep(retry_delay)
+            retry_delay *= 2  # Exponential backoff
+    
+    # All retries exhausted
+    logger.error(f"TTS failed after {max_retries} attempts: {last_error}")
+    logger.error(traceback.format_exc())
+    raise HTTPException(status_code=500, detail=f"TTS failed after retries: {str(last_error)}")
