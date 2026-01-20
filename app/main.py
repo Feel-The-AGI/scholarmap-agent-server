@@ -1635,7 +1635,7 @@ async def analyze_eligibility_batch(profile: UserProfile, programs: list[dict]) 
             )
             
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-pro-preview-05-06",
+                model="gemini-2.5-pro",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -1749,7 +1749,7 @@ Return ONLY the summary text, no JSON."""
     
     try:
         summary_response = gemini_client.models.generate_content(
-            model="gemini-2.5-pro-preview-05-06",
+            model="gemini-2.5-pro",
             contents=summary_prompt,
             config=types.GenerateContentConfig(max_output_tokens=200)
         )
@@ -1875,7 +1875,7 @@ async def onboarding_chat(request: OnboardingChatRequest):
         )
         
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-pro-preview-05-06",
+            model="gemini-2.5-pro",
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
