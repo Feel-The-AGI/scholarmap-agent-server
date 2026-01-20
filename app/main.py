@@ -1935,3 +1935,86 @@ async def onboarding_chat(request: OnboardingChatRequest):
             next_step=request.current_step + 1,
             is_complete=step >= 4
         )
+
+
+# ============================================================================
+# TEXT-TO-SPEECH ENDPOINT - Gemini 2.5 Flash TTS
+# ============================================================================
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "Aoede"  # Default to warm female voice for Ada
+    style: str | None = None  # Optional style instruction like "warmly and encouragingly"
+
+class TTSResponse(BaseModel):
+    audio_base64: str
+    format: str = "pcm"
+    sample_rate: int = 24000
+    
+# Available female voices for Ada (from Gemini TTS):
+# - Aoede: Warm, friendly, conversational
+# - Kore: Professional, clear
+# - Leda: Gentle, nurturing
+# - Zephyr: Bright, energetic
+
+@app.post("/tts", response_model=TTSResponse)
+async def text_to_speech(request: TTSRequest):
+    """Convert text to speech using Gemini 2.5 Flash TTS with realistic female voice."""
+    logger.info(f"TTS request: {len(request.text)} chars, voice={request.voice}")
+    
+    if not gemini_client:
+        logger.error("Gemini client not initialized")
+        raise HTTPException(status_code=500, detail="TTS service unavailable")
+    
+    try:
+        # Build the TTS prompt with optional style instruction
+        if request.style:
+            tts_prompt = f"Say {request.style}: {request.text}"
+        else:
+            # Default warm, friendly style for Ada
+            tts_prompt = f"Say warmly and conversationally: {request.text}"
+        
+        logger.debug(f"TTS prompt: {tts_prompt[:100]}...")
+        
+        # Call Gemini 2.5 Flash TTS
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash-preview-tts",
+            contents=tts_prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=request.voice,
+                        )
+                    )
+                ),
+            )
+        )
+        
+        # Extract audio data (base64 encoded)
+        if response.candidates and response.candidates[0].content.parts:
+            audio_data = response.candidates[0].content.parts[0].inline_data.data
+            
+            # The data is already base64 encoded from Gemini
+            import base64
+            if isinstance(audio_data, bytes):
+                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+            else:
+                audio_base64 = audio_data  # Already base64 string
+            
+            logger.info(f"TTS generated: {len(audio_base64)} chars of base64 audio")
+            
+            return TTSResponse(
+                audio_base64=audio_base64,
+                format="pcm",
+                sample_rate=24000
+            )
+        else:
+            logger.error("No audio data in TTS response")
+            raise HTTPException(status_code=500, detail="No audio generated")
+            
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}")
