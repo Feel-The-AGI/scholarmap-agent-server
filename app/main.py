@@ -1774,3 +1774,145 @@ Return ONLY the summary text, no JSON."""
         processing_time=processing_time,
         ai_summary=ai_summary
     )
+
+
+# ============================================
+# AI CONVERSATIONAL ONBOARDING
+# ============================================
+
+class OnboardingMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: str
+
+class OnboardingChatRequest(BaseModel):
+    messages: list[OnboardingMessage]
+    current_step: int
+    extracted_data: dict
+
+class OnboardingChatResponse(BaseModel):
+    response: str
+    extracted_data: dict
+    next_step: int
+    is_complete: bool
+
+ONBOARDING_PROMPT = """You are Ada, a friendly scholarship advisor helping a student build their profile. 
+You're having a natural conversation to extract the following information:
+- Full name
+- Nationality  
+- Country of residence
+- Current education level (high school, undergraduate, graduate, professional)
+- Current/last institution
+- Graduation year
+- GPA (on 4.0 scale)
+- Target degree (bachelor, masters, phd, postdoc)
+- Fields of interest
+- Preferred countries to study
+- Work experience (years)
+- Languages spoken
+- Special circumstances (financial need, first-gen, refugee, disability)
+
+CONVERSATION HISTORY:
+{messages}
+
+DATA EXTRACTED SO FAR:
+{extracted_data}
+
+CURRENT STEP: {step}
+
+Rules:
+1. Be conversational, warm, and encouraging - NOT robotic
+2. Ask 1-2 questions at a time max
+3. Acknowledge what they told you before asking more
+4. Extract data from their natural responses
+5. Don't ask for info they already provided
+6. After ~5 exchanges, wrap up and confirm
+
+Return JSON only:
+{{
+  "response": "<your natural message to the user>",
+  "extracted_data": {{
+    "full_name": "<if mentioned>",
+    "nationality": "<if mentioned>",
+    "country_of_residence": "<if mentioned>",
+    "current_education_level": "<high_school|undergraduate|graduate|professional if mentioned>",
+    "current_institution": "<if mentioned>",
+    "graduation_year": <number if mentioned>,
+    "gpa": <number if mentioned>,
+    "target_degree": "<bachelor|masters|phd|postdoc if mentioned>",
+    "target_fields": ["<fields if mentioned>"],
+    "preferred_countries": ["<countries if mentioned>"],
+    "work_experience_years": <number if mentioned>,
+    "languages": [{{"language": "<name>", "proficiency": "<native|fluent|intermediate|basic>"}}],
+    "circumstances": {{
+      "financial_need": <true/false if mentioned>,
+      "first_gen": <true/false if mentioned>,
+      "refugee": <true/false if mentioned>,
+      "disability": <true/false if mentioned>
+    }}
+  }},
+  "next_step": <current step + 1>,
+  "is_complete": <true if enough info gathered, usually after step 4-5>
+}}
+"""
+
+@app.post("/onboarding/chat", response_model=OnboardingChatResponse)
+async def onboarding_chat(request: OnboardingChatRequest):
+    """AI-powered conversational onboarding to extract user profile."""
+    try:
+        # Format messages for prompt
+        messages_text = "\n".join([
+            f"{m.role.upper()}: {m.content}" for m in request.messages
+        ])
+        
+        # Format extracted data
+        extracted_text = json.dumps(request.extracted_data, indent=2) if request.extracted_data else "None yet"
+        
+        prompt = ONBOARDING_PROMPT.format(
+            messages=messages_text,
+            extracted_data=extracted_text,
+            step=request.current_step
+        )
+        
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-pro-preview-05-06",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                max_output_tokens=1024,
+                temperature=0.7
+            )
+        )
+        
+        result_text = response.text.strip()
+        if result_text.startswith("```"):
+            result_text = result_text.split("```")[1]
+            if result_text.startswith("json"):
+                result_text = result_text[4:]
+        result_text = result_text.strip()
+        
+        result = json.loads(result_text)
+        
+        # Merge new extracted data with existing
+        merged_data = {**request.extracted_data}
+        if result.get("extracted_data"):
+            for key, value in result["extracted_data"].items():
+                if value is not None and value != "" and value != []:
+                    merged_data[key] = value
+        
+        return OnboardingChatResponse(
+            response=result.get("response", "Thanks for sharing! Let me process that..."),
+            extracted_data=merged_data,
+            next_step=result.get("next_step", request.current_step + 1),
+            is_complete=result.get("is_complete", False)
+        )
+        
+    except Exception as e:
+        logger.error(f"Onboarding chat error: {e}")
+        # Return a friendly fallback response
+        return OnboardingChatResponse(
+            response="Thanks! Could you tell me a bit more about yourself?",
+            extracted_data=request.extracted_data,
+            next_step=request.current_step + 1,
+            is_complete=False
+        )
