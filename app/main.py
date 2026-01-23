@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import base64
 from pydantic import BaseModel, HttpUrl, ValidationError
 from supabase import create_client, Client
 import httpx
@@ -2045,3 +2046,188 @@ async def text_to_speech(request: TTSRequest):
     logger.error(f"TTS failed after {max_retries} attempts: {last_error}")
     logger.error(traceback.format_exc())
     raise HTTPException(status_code=500, detail=f"TTS failed after retries: {str(last_error)}")
+
+
+# ============================================================================
+# GEMINI LIVE API - Real-time Speech-to-Speech for Ada
+# ============================================================================
+
+LIVE_API_SYSTEM_INSTRUCTION = """You are Ada, a warm and friendly scholarship advisor at ScholarMap.
+You're having a voice conversation to help students find scholarships.
+
+Your personality:
+- Warm, encouraging, and supportive
+- Professional but approachable  
+- Concise - keep responses brief for natural conversation
+- Ask one question at a time
+
+Your goal is to collect this information through natural conversation:
+1. Name and nationality
+2. Current education (degree, field, institution)
+3. Target degree (bachelor/masters/phd) and preferred countries
+4. GPA and work experience
+5. Special circumstances (first-gen, financial need, refugee status)
+
+Start by greeting them and asking their name and where they're from.
+After collecting all info, let them know you'll find matching scholarships.
+"""
+
+class LiveSessionManager:
+    """Manages Gemini Live API sessions for each WebSocket connection."""
+    
+    def __init__(self):
+        self.sessions = {}
+    
+    async def create_session(self, session_id: str):
+        """Create a new Gemini Live session."""
+        try:
+            config = {
+                "response_modalities": ["AUDIO"],
+                "system_instruction": LIVE_API_SYSTEM_INSTRUCTION,
+                "speech_config": {
+                    "voice_config": {
+                        "prebuilt_voice_config": {
+                            "voice_name": "Kore"  # Female voice for Ada
+                        }
+                    }
+                }
+            }
+            
+            session = await gemini_client.aio.live.connect(
+                model="gemini-2.5-flash-preview-native-audio",
+                config=config
+            )
+            
+            self.sessions[session_id] = session
+            logger.info(f"Live session created: {session_id}")
+            return session
+            
+        except Exception as e:
+            logger.error(f"Failed to create Live session: {e}")
+            raise
+    
+    async def close_session(self, session_id: str):
+        """Close a Live session."""
+        if session_id in self.sessions:
+            try:
+                session = self.sessions[session_id]
+                await session.close()
+            except:
+                pass
+            del self.sessions[session_id]
+            logger.info(f"Live session closed: {session_id}")
+
+live_session_manager = LiveSessionManager()
+
+
+@app.websocket("/live/ada")
+async def websocket_ada_live(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time speech-to-speech with Ada.
+    
+    Protocol:
+    - Client sends: {"type": "audio", "data": "<base64 PCM 16kHz>"}
+    - Client sends: {"type": "text", "data": "<text message>"}
+    - Server sends: {"type": "audio", "data": "<base64 PCM 24kHz>"}
+    - Server sends: {"type": "transcript", "data": "<text>"}
+    - Server sends: {"type": "turn_complete"}
+    """
+    await websocket.accept()
+    session_id = str(id(websocket))
+    logger.info(f"WebSocket connected: {session_id}")
+    
+    live_session = None
+    receive_task = None
+    
+    try:
+        # Create Gemini Live session
+        live_session = await live_session_manager.create_session(session_id)
+        
+        # Task to receive from Gemini and forward to client
+        async def receive_from_gemini():
+            try:
+                async for response in live_session.receive():
+                    if response.server_content:
+                        # Handle model turn (audio response)
+                        if response.server_content.model_turn:
+                            for part in response.server_content.model_turn.parts:
+                                if part.inline_data and part.inline_data.data:
+                                    # Send audio to client
+                                    audio_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                                    await websocket.send_json({
+                                        "type": "audio",
+                                        "data": audio_b64
+                                    })
+                        
+                        # Handle output transcription
+                        if response.server_content.output_transcription:
+                            await websocket.send_json({
+                                "type": "transcript",
+                                "data": response.server_content.output_transcription.text
+                            })
+                        
+                        # Handle turn complete
+                        if response.server_content.turn_complete:
+                            await websocket.send_json({"type": "turn_complete"})
+                        
+                        # Handle interruption
+                        if response.server_content.interrupted:
+                            await websocket.send_json({"type": "interrupted"})
+                            
+            except Exception as e:
+                logger.error(f"Error receiving from Gemini: {e}")
+        
+        # Start receive task
+        receive_task = asyncio.create_task(receive_from_gemini())
+        
+        # Send initial greeting by prompting Ada
+        await live_session.send_client_content(
+            turns={"role": "user", "parts": [{"text": "Start the conversation by greeting me."}]},
+            turn_complete=True
+        )
+        
+        # Main loop: receive from client and forward to Gemini
+        while True:
+            try:
+                data = await websocket.receive_json()
+                msg_type = data.get("type")
+                
+                if msg_type == "audio":
+                    # Decode base64 audio and send to Gemini
+                    audio_data = base64.b64decode(data.get("data", ""))
+                    await live_session.send_realtime_input(
+                        audio={"data": audio_data, "mime_type": "audio/pcm;rate=16000"}
+                    )
+                
+                elif msg_type == "text":
+                    # Send text message to Gemini
+                    text = data.get("data", "")
+                    await live_session.send_client_content(
+                        turns={"role": "user", "parts": [{"text": text}]},
+                        turn_complete=True
+                    )
+                
+                elif msg_type == "end_turn":
+                    # Signal end of user's turn
+                    await live_session.send_client_content(turn_complete=True)
+                    
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected: {session_id}")
+                break
+            except Exception as e:
+                logger.error(f"Error processing client message: {e}")
+                await websocket.send_json({"type": "error", "data": str(e)})
+    
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "data": str(e)})
+        except:
+            pass
+    
+    finally:
+        # Cleanup
+        if receive_task:
+            receive_task.cancel()
+        await live_session_manager.close_session(session_id)
+        logger.info(f"WebSocket cleanup complete: {session_id}")
