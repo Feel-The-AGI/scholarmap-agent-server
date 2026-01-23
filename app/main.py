@@ -2072,54 +2072,6 @@ Start by greeting them and asking their name and where they're from.
 After collecting all info, let them know you'll find matching scholarships.
 """
 
-class LiveSessionManager:
-    """Manages Gemini Live API sessions for each WebSocket connection."""
-    
-    def __init__(self):
-        self.sessions = {}
-    
-    async def create_session(self, session_id: str):
-        """Create a new Gemini Live session."""
-        try:
-            config = {
-                "response_modalities": ["AUDIO"],
-                "system_instruction": LIVE_API_SYSTEM_INSTRUCTION,
-                "speech_config": {
-                    "voice_config": {
-                        "prebuilt_voice_config": {
-                            "voice_name": "Kore"  # Female voice for Ada
-                        }
-                    }
-                }
-            }
-            
-            session = await gemini_client.aio.live.connect(
-                model="gemini-2.5-flash-preview-native-audio",
-                config=config
-            )
-            
-            self.sessions[session_id] = session
-            logger.info(f"Live session created: {session_id}")
-            return session
-            
-        except Exception as e:
-            logger.error(f"Failed to create Live session: {e}")
-            raise
-    
-    async def close_session(self, session_id: str):
-        """Close a Live session."""
-        if session_id in self.sessions:
-            try:
-                session = self.sessions[session_id]
-                await session.close()
-            except:
-                pass
-            del self.sessions[session_id]
-            logger.info(f"Live session closed: {session_id}")
-
-live_session_manager = LiveSessionManager()
-
-
 @app.websocket("/live/ada")
 async def websocket_ada_live(websocket: WebSocket):
     """
@@ -2132,91 +2084,108 @@ async def websocket_ada_live(websocket: WebSocket):
     - Server sends: {"type": "transcript", "data": "<text>"}
     - Server sends: {"type": "turn_complete"}
     """
+    from google.genai import types as genai_types
+    
     await websocket.accept()
     session_id = str(id(websocket))
     logger.info(f"WebSocket connected: {session_id}")
     
-    live_session = None
     receive_task = None
     
     try:
-        # Create Gemini Live session
-        live_session = await live_session_manager.create_session(session_id)
-        
-        # Task to receive from Gemini and forward to client
-        async def receive_from_gemini():
-            try:
-                async for response in live_session.receive():
-                    if response.server_content:
-                        # Handle model turn (audio response)
-                        if response.server_content.model_turn:
-                            for part in response.server_content.model_turn.parts:
-                                if part.inline_data and part.inline_data.data:
-                                    # Send audio to client
-                                    audio_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
-                                    await websocket.send_json({
-                                        "type": "audio",
-                                        "data": audio_b64
-                                    })
-                        
-                        # Handle output transcription
-                        if response.server_content.output_transcription:
-                            await websocket.send_json({
-                                "type": "transcript",
-                                "data": response.server_content.output_transcription.text
-                            })
-                        
-                        # Handle turn complete
-                        if response.server_content.turn_complete:
-                            await websocket.send_json({"type": "turn_complete"})
-                        
-                        # Handle interruption
-                        if response.server_content.interrupted:
-                            await websocket.send_json({"type": "interrupted"})
-                            
-            except Exception as e:
-                logger.error(f"Error receiving from Gemini: {e}")
-        
-        # Start receive task
-        receive_task = asyncio.create_task(receive_from_gemini())
-        
-        # Send initial greeting by prompting Ada
-        await live_session.send_client_content(
-            turns={"role": "user", "parts": [{"text": "Start the conversation by greeting me."}]},
-            turn_complete=True
+        # Build Live API config
+        config = genai_types.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            system_instruction=genai_types.Content(
+                parts=[genai_types.Part(text=LIVE_API_SYSTEM_INSTRUCTION)]
+            ),
+            speech_config=genai_types.SpeechConfig(
+                voice_config=genai_types.VoiceConfig(
+                    prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                        voice_name="Kore"  # Female voice for Ada
+                    )
+                )
+            )
         )
         
-        # Main loop: receive from client and forward to Gemini
-        while True:
-            try:
-                data = await websocket.receive_json()
-                msg_type = data.get("type")
-                
-                if msg_type == "audio":
-                    # Decode base64 audio and send to Gemini
-                    audio_data = base64.b64decode(data.get("data", ""))
-                    await live_session.send_realtime_input(
-                        audio={"data": audio_data, "mime_type": "audio/pcm;rate=16000"}
-                    )
-                
-                elif msg_type == "text":
-                    # Send text message to Gemini
-                    text = data.get("data", "")
-                    await live_session.send_client_content(
-                        turns={"role": "user", "parts": [{"text": text}]},
-                        turn_complete=True
-                    )
-                
-                elif msg_type == "end_turn":
-                    # Signal end of user's turn
-                    await live_session.send_client_content(turn_complete=True)
+        # Use async context manager properly
+        async with gemini_client.aio.live.connect(
+            model="gemini-2.5-flash-preview-native-audio",
+            config=config
+        ) as live_session:
+            logger.info(f"Live session created: {session_id}")
+            
+            # Task to receive from Gemini and forward to client
+            async def receive_from_gemini():
+                try:
+                    async for response in live_session.receive():
+                        if response.server_content:
+                            # Handle model turn (audio response)
+                            if response.server_content.model_turn:
+                                for part in response.server_content.model_turn.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        # Send audio to client
+                                        audio_b64 = base64.b64encode(part.inline_data.data).decode('utf-8')
+                                        await websocket.send_json({
+                                            "type": "audio",
+                                            "data": audio_b64
+                                        })
+                            
+                            # Handle output transcription
+                            if response.server_content.output_transcription:
+                                await websocket.send_json({
+                                    "type": "transcript",
+                                    "data": response.server_content.output_transcription.text
+                                })
+                            
+                            # Handle turn complete
+                            if response.server_content.turn_complete:
+                                await websocket.send_json({"type": "turn_complete"})
+                            
+                            # Handle interruption
+                            if response.server_content.interrupted:
+                                await websocket.send_json({"type": "interrupted"})
+                                
+                except asyncio.CancelledError:
+                    logger.info(f"Receive task cancelled: {session_id}")
+                except Exception as e:
+                    logger.error(f"Error receiving from Gemini: {e}")
+            
+            # Start receive task
+            receive_task = asyncio.create_task(receive_from_gemini())
+            
+            # Send initial greeting by prompting Ada
+            await live_session.send(input="Start the conversation by greeting me warmly.", end_of_turn=True)
+            
+            # Main loop: receive from client and forward to Gemini
+            while True:
+                try:
+                    data = await websocket.receive_json()
+                    msg_type = data.get("type")
                     
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected: {session_id}")
-                break
-            except Exception as e:
-                logger.error(f"Error processing client message: {e}")
-                await websocket.send_json({"type": "error", "data": str(e)})
+                    if msg_type == "audio":
+                        # Decode base64 audio and send to Gemini
+                        audio_data = base64.b64decode(data.get("data", ""))
+                        await live_session.send(input=genai_types.Blob(
+                            data=audio_data,
+                            mime_type="audio/pcm;rate=16000"
+                        ))
+                    
+                    elif msg_type == "text":
+                        # Send text message to Gemini
+                        text = data.get("data", "")
+                        await live_session.send(input=text, end_of_turn=True)
+                    
+                    elif msg_type == "end_turn":
+                        # Signal end of user's turn
+                        await live_session.send(input="", end_of_turn=True)
+                        
+                except WebSocketDisconnect:
+                    logger.info(f"WebSocket disconnected: {session_id}")
+                    break
+                except Exception as e:
+                    logger.error(f"Error processing client message: {e}")
+                    await websocket.send_json({"type": "error", "data": str(e)})
     
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
@@ -2229,5 +2198,4 @@ async def websocket_ada_live(websocket: WebSocket):
         # Cleanup
         if receive_task:
             receive_task.cancel()
-        await live_session_manager.close_session(session_id)
         logger.info(f"WebSocket cleanup complete: {session_id}")
