@@ -72,7 +72,7 @@ async def websocket_ada_live(websocket: WebSocket):
         logger.debug("Initiating Live API connection...")
         # Use async context manager properly
         async with gemini_client.aio.live.connect(
-            model="gemini-2.5-flash-preview-native-audio",
+            model="gemini-2.5-flash-native-audio-preview-12-2025",
             config=config
         ) as live_session:
             logger.info(f"Live session CREATED: {session_id}")
